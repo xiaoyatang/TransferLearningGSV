@@ -1,4 +1,5 @@
 
+### This repository is to post-train and evaluate different model architectures(vim/vit/swin) on GSV downstream tasks.
 ## Envs. for Pretraining
 
 - NVIDIA GPUs:
