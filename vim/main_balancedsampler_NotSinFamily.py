@@ -20,7 +20,7 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
-from samplers import RASampler
+from samplers import RASampler, BalancedRASampler
 from augment import new_data_aug_generator
 
 from contextlib import suppress
@@ -39,7 +39,6 @@ def get_args_parser():
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--bce-loss', action='store_true')
     parser.add_argument('--unscale-lr', action='store_true')
-    parser.add_argument('--freeze_backbone', action='store_true') 
 
     # Model parameters
     parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
@@ -161,7 +160,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data_set', default='NotSinFamily', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily', 'GREEN30', 'SIDEWALKS'],
+    parser.add_argument('--data_set', default='NotSinFamily', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily'],
                         type=str, help='Image Net dataset path') # data-set
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -195,9 +194,6 @@ def get_args_parser():
     parser.add_argument('--if_amp', action='store_true')
     parser.add_argument('--no_amp', action='store_false', dest='if_amp')
     parser.set_defaults(if_amp=False)
-
-    parser.add_argument('--attn_map', action='store_true', help='Draw attention map only in eval mode')
-    parser.add_argument('--attn_threshold', type=float, default=None, help='We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass')
 
     # if continue with inf
     parser.add_argument('--if_continue_inf', action='store_true')
@@ -258,11 +254,15 @@ def main(args):
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
     if args.distributed:
+        print("distributed data sampler.")
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         if args.repeated_aug:
-            sampler_train = RASampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            # sampler_train = RASampler(
+            #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            # )
+            sampler_train = BalancedRASampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, num_repeats = 2,batch_size=args.batch_size
             )
         else:
             sampler_train = torch.utils.data.DistributedSampler(
@@ -280,6 +280,7 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        print("no distributed!")
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -299,6 +300,8 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=False
     )
+    print('train_dataloader',len(data_loader_train),len(data_loader_train.dataset))
+    print('val_dataloader',len(data_loader_val),len(data_loader_val.dataset))
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -378,16 +381,6 @@ def main(args):
                 print(f"{name}: {param.norm():.4f}")
                 break  # Just check one or two
 
-        if args.freeze_backbone:
-            print("🚫 Freezing backbone parameters (excluding classification head).")
-            for name, param in model.named_parameters():
-                if not (name.startswith('head.') or name.startswith('head_dist.')):
-                    param.requires_grad = False
-            # ✅ Sanity check: Print requires_grad status
-            trainable = [name for name, p in model.named_parameters() if p.requires_grad]
-            assert all(n.startswith('head.') or n.startswith('head_dist.') for n in trainable), \
-                f"Unexpected trainable params: {trainable}"
-        
     if args.attn_only:
         for name_p,p in model.named_parameters():
             if '.attn.' in name_p:
@@ -509,7 +502,7 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device, amp_autocast, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-        test_stats = evaluate(data_loader_val, model_ema, device, amp_autocast, args)
+        test_stats = evaluate(data_loader_val, model_ema.ema, device, amp_autocast, args)
         print(f"Accuracy of the ema network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
     

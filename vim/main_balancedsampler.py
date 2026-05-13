@@ -18,9 +18,9 @@ from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate
+from engineOriginal import train_one_epoch, evaluate
 from losses import DistillationLoss
-from samplers import RASampler
+from samplers import RASampler, BalancedRASampler
 from augment import new_data_aug_generator
 
 from contextlib import suppress
@@ -31,7 +31,22 @@ import utils
 
 # log about
 import mlflow
+from torch import nn as nn
 
+class MultiLabelHead(nn.Module):
+    def __init__(self, in_features=768, hidden_features=512, out_features=11, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        return x
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -161,7 +176,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data_set', default='NotSinFamily', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily', 'GREEN30', 'SIDEWALKS'],
+    parser.add_argument('--data_set', default='STREET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily', 'GREEN30','SIDEWALKS','SPEEDBUMPS'],
                         type=str, help='Image Net dataset path') # data-set
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -176,6 +191,8 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
+    parser.add_argument('--attn_map', action='store_true', help='Draw attention map only in eval mode')
+    parser.add_argument('--attn_threshold', type=float, default=None, help='We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass')
     parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=10, type=int)
@@ -195,9 +212,6 @@ def get_args_parser():
     parser.add_argument('--if_amp', action='store_true')
     parser.add_argument('--no_amp', action='store_false', dest='if_amp')
     parser.set_defaults(if_amp=False)
-
-    parser.add_argument('--attn_map', action='store_true', help='Draw attention map only in eval mode')
-    parser.add_argument('--attn_threshold', type=float, default=None, help='We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass')
 
     # if continue with inf
     parser.add_argument('--if_continue_inf', action='store_true')
@@ -258,11 +272,15 @@ def main(args):
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
     if args.distributed:
+        print("distributed data sampler.")
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         if args.repeated_aug:
-            sampler_train = RASampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            # sampler_train = RASampler(
+            #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            # )
+            sampler_train = BalancedRASampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, num_repeats = 2,batch_size=args.batch_size
             )
         else:
             sampler_train = torch.utils.data.DistributedSampler(
@@ -280,6 +298,7 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        print("no distributed!")
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -299,6 +318,8 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=False
     )
+    print('train_dataloader',len(data_loader_train),len(data_loader_train.dataset))
+    print('val_dataloader',len(data_loader_val),len(data_loader_val.dataset))
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -318,6 +339,7 @@ def main(args):
         drop_block_rate=None,
         img_size=args.input_size
     )
+    # model.head = MultiLabelHead(in_features=384, hidden_features=256, out_features=args.nb_classes, dropout=0.1)
     for name, param in model.named_parameters():
         if 'backbone' in name or 'layers' in name:  # Adjust prefix to match your model
             print(f"{name}: {param.norm():.4f}")
@@ -344,10 +366,15 @@ def main(args):
             print("❌ This is NOT a DINO checkpoint, likely load from ImageNet pretrained weights.")
             checkpoint_model = checkpoint['model']
             state_dict = model.state_dict()
-            for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
-                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint")
-                    del checkpoint_model[k]
+            # for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+            #     if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+            #         print(f"Removing key {k} from pretrained checkpoint")
+            #         del checkpoint_model[k]
+                    # ✅ Only remove head weights if they don't match (e.g. pretrained on 1000 classes)
+            keys_to_remove = [k for k in checkpoint_model.keys() if k.startswith("head.")]
+            for k in keys_to_remove:
+                print(f"Removing incompatible key {k} from checkpoint")
+                del checkpoint_model[k]
 
         # interpolate position embedding
         pos_embed_checkpoint = checkpoint_model['pos_embed']
@@ -370,14 +397,16 @@ def main(args):
         checkpoint_model['pos_embed'] = new_pos_embed
 
         # model.load_state_dict(checkpoint_model, strict=False)
+        # print("Head.fc1 before load:", model.head.fc1.weight[0, :5])
         missing, unexpected = model.load_state_dict(checkpoint_model, strict=False)
+        # print("Head.fc1 after load:", model.head.fc1.weight[0, :5])
         print("Missing keys:", missing)
         print("Unexpected keys:", unexpected)
         for name, param in model.named_parameters():
             if 'backbone' in name or 'layers' in name:  # Adjust prefix to match your model
                 print(f"{name}: {param.norm():.4f}")
                 break  # Just check one or two
-
+            
         if args.freeze_backbone:
             print("🚫 Freezing backbone parameters (excluding classification head).")
             for name, param in model.named_parameters():
@@ -388,6 +417,7 @@ def main(args):
             assert all(n.startswith('head.') or n.startswith('head_dist.') for n in trainable), \
                 f"Unexpected trainable params: {trainable}"
         
+
     if args.attn_only:
         for name_p,p in model.named_parameters():
             if '.attn.' in name_p:
@@ -509,7 +539,7 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device, amp_autocast, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-        test_stats = evaluate(data_loader_val, model_ema, device, amp_autocast, args)
+        test_stats = evaluate(data_loader_val, model_ema.ema, device, amp_autocast, args)
         print(f"Accuracy of the ema network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
     

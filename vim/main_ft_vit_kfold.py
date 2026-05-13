@@ -18,7 +18,7 @@ from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate
+from engine5tasks import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 from augment import new_data_aug_generator
@@ -26,12 +26,13 @@ from augment import new_data_aug_generator
 from contextlib import suppress
 
 import models_mamba
-
+import vision_transformer as vits # DINO's local vision_transformer.py
+from torchvision import models as torchvision_models
 import utils
 
 # log about
 import mlflow
-
+from torch import nn as nn
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -39,11 +40,14 @@ def get_args_parser():
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--bce-loss', action='store_true')
     parser.add_argument('--unscale-lr', action='store_true')
-    parser.add_argument('--freeze_backbone', action='store_true') 
 
     # Model parameters
     parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
+    parser.add_argument('--patch_size', default=16, type=int) # for vit_small, matching dino
+    parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")# for vit_small, matching dino
+    parser.add_argument('--freeze_backbone', action='store_true') 
+
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -161,7 +165,11 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data_set', default='NotSinFamily', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily', 'GREEN30', 'SIDEWALKS'],
+    parser.add_argument('--train_csv_path', default='/uu/sci.utah.edu/projects/DeepLearning/Xiaoya_GSV/unsupervised_pretrained_models_eval/chicago_combined_data/5-fold-split/train_fold_1.csv', type=str,
+                        help='train csv path in 5-fold')
+    parser.add_argument('--val_csv_path', default='/uu/sci.utah.edu/projects/DeepLearning/Xiaoya_GSV/unsupervised_pretrained_models_eval/chicago_combined_data/5-fold-split/val_fold_1.csv', type=str,
+                        help='val csv path in 5-fold')
+    parser.add_argument('--data_set', default='COMBINED', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily', 'GREEN30', 'COMBINED'],
                         type=str, help='Image Net dataset path') # data-set
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -196,9 +204,6 @@ def get_args_parser():
     parser.add_argument('--no_amp', action='store_false', dest='if_amp')
     parser.set_defaults(if_amp=False)
 
-    parser.add_argument('--attn_map', action='store_true', help='Draw attention map only in eval mode')
-    parser.add_argument('--attn_threshold', type=float, default=None, help='We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass')
-
     # if continue with inf
     parser.add_argument('--if_continue_inf', action='store_true')
     parser.add_argument('--no_continue_inf', action='store_false', dest='if_continue_inf')
@@ -228,6 +233,21 @@ def is_dino_checkpoint(ckpt):
         "teacher" in ckpt and
         "dino_loss" in ckpt
     )
+
+class MultiLabelHead(nn.Module):
+    def __init__(self, in_features=768, hidden_features=512, out_features=11, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        return x
 
 def main(args):
     utils.init_distributed_mode(args)
@@ -286,7 +306,7 @@ def main(args):
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=True,
+        drop_last=False, # True in default
     )
     if args.ThreeAugment:
         data_loader_train.dataset.transform = new_data_aug_generator(args)
@@ -301,28 +321,30 @@ def main(args):
     )
 
     mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
+    # mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    mixup_active = False # manually disable mixup(linearly mixed soft labels as an augmentation)in combined training
+    # if mixup_active:
+    #     mixup_fn = Mixup(
+    #         mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+    #         prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+    #         label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
-    model = create_model(
-        args.model,
-        pretrained=False,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        img_size=args.input_size
-    )
-    for name, param in model.named_parameters():
-        if 'backbone' in name or 'layers' in name:  # Adjust prefix to match your model
-            print(f"{name}: {param.norm():.4f}")
-            break  # Just check one or two
+    if args.model in vits.__dict__:
+        # Vision Transformer models from local definition
+        model = vits.__dict__[args.model](
+            patch_size=args.patch_size,
+            drop_path_rate=args.drop_path_rate,  # stochastic depth
+            num_classes=0,   # temporarily set to 0 so we override head manually
+        )
+    # Here: 4 binary labels (2 classes each) + 1 three-class label
+    model.head = MultiLabelHead(in_features=768, hidden_features=512, out_features=11, dropout=0.1)
+    # model.head = nn.Linear(in_features=768, out_features=11, bias=True)
 
+    for name, param in model.named_parameters():
+        if 'blocks' in name or 'layers' in name:  # Adjust prefix to match your model
+            print(f"Before loading pretrained weights, {name}: {param.norm():.4f}")
+            break  # Just check one or two
                     
     if args.finetune:
         if args.finetune.startswith('https'):
@@ -330,6 +352,8 @@ def main(args):
                 args.finetune, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.finetune, map_location='cpu')
+
+        print(f"🔍 Loaded checkpoint from {args.finetune} with keys: {checkpoint.keys()}")
 
         if is_dino_checkpoint(checkpoint):
             print("✅ This is a DINO checkpoint.")
@@ -340,44 +364,46 @@ def main(args):
             checkpoint_model = {
                 k.replace("backbone.", ""): v for k, v in student_state_dict.items() if k.startswith("backbone.")
             }
-        else:
+        elif "student" in checkpoint and "teacher" in checkpoint:
             print("❌ This is NOT a DINO checkpoint, likely load from ImageNet pretrained weights.")
-            checkpoint_model = checkpoint['model']
+            if "model" in checkpoint:
+                print("🔹 Detected ImageNet-style checkpoint.")
+                checkpoint_model = checkpoint['model']
+                state_dict = model.state_dict()
+                for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+                    if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                        print(f"Removing key {k} from pretrained checkpoint")
+                        del checkpoint_model[k]
+            else: # for IN pretrained models that DINO provided which contains 'student','teacher' and 'early_stopping_epoch'
+                print("🔹 Detected DINO-style checkpoint.")
+                student_state_dict = checkpoint["student"]
+                student_state_dict = {k.replace("module.", ""): v for k, v in student_state_dict.items()}
+                checkpoint_model = {
+                    k.replace("backbone.", ""): v for k, v in student_state_dict.items() if k.startswith("backbone.")
+                }
+        elif "model" in checkpoint:  # standard timm-style checkpoint
+            print("📦 Detected standard timm/ImageNet checkpoint, likely after a fine-tuning.")
+            checkpoint_model = checkpoint["model"]
             state_dict = model.state_dict()
-            for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
-                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint")
+            for k in ["head.weight", "head.bias", "head_dist.weight", "head_dist.bias"]:
+                if k in checkpoint_model and k in state_dict and checkpoint_model[k].shape != state_dict[k].shape:
+                    print(f"Removing key {k} from pretrained checkpoint (shape mismatch).")
                     del checkpoint_model[k]
+        else:
+            raise ValueError(f"Unrecognized checkpoint format: keys={checkpoint.keys()}")
 
-        # interpolate position embedding
-        pos_embed_checkpoint = checkpoint_model['pos_embed']
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        num_patches = model.patch_embed.num_patches
-        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
-        # height (== width) for the checkpoint position embedding
-        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-        # height (== width) for the new position embedding
-        new_size = int(num_patches ** 0.5)
-        # class_token and dist_token are kept unchanged
-        extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-        # only the position tokens are interpolated
-        pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-        pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-        pos_tokens = torch.nn.functional.interpolate(
-            pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-        pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-        new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-        checkpoint_model['pos_embed'] = new_pos_embed
-
+        print("🔧 Loading model state dict...")
         # model.load_state_dict(checkpoint_model, strict=False)
         missing, unexpected = model.load_state_dict(checkpoint_model, strict=False)
+        print("✅ Model loaded.")
         print("Missing keys:", missing)
         print("Unexpected keys:", unexpected)
+        
         for name, param in model.named_parameters():
-            if 'backbone' in name or 'layers' in name:  # Adjust prefix to match your model
-                print(f"{name}: {param.norm():.4f}")
-                break  # Just check one or two
-
+            if 'blocks' in name or 'layers' in name:
+                print(f"After loading pretrained weights from {args.finetune}, {name}: {param.norm():.4f}")
+                break
+        
         if args.freeze_backbone:
             print("🚫 Freezing backbone parameters (excluding classification head).")
             for name, param in model.named_parameters():
@@ -388,6 +414,7 @@ def main(args):
             assert all(n.startswith('head.') or n.startswith('head_dist.') for n in trainable), \
                 f"Unexpected trainable params: {trainable}"
         
+
     if args.attn_only:
         for name_p,p in model.named_parameters():
             if '.attn.' in name_p:
@@ -411,7 +438,7 @@ def main(args):
             print('no patch embed')
             
     model.to(device)
-
+    # print(model)
     model_ema = None
     if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
@@ -446,7 +473,7 @@ def main(args):
 
     if mixup_active:
         # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
+        criterion = SoftTargetCrossEntropy() # This is default!!
     elif args.smoothing:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
@@ -454,7 +481,7 @@ def main(args):
         
     if args.bce_loss:
         criterion = torch.nn.BCEWithLogitsLoss()
-        
+
     teacher_model = None
     if args.distillation_type != 'none':
         assert args.teacher_path, 'need to specify teacher-path when using distillation'
@@ -487,8 +514,15 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
 
+        print(f"🔍 Resuming from checkpoint: {args.resume}")
+        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        print(f"After loading pretrained weights, blocks.0.norm1.weight: {model_without_ddp.blocks[0].norm1.weight.data.mean().item():.4f}")
+        if missing_keys:
+            print(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys}")
+            
         # add ema load
         if args.model_ema:
                 utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
@@ -505,11 +539,11 @@ def main(args):
                 loss_scaler = 'none'
         lr_scheduler.step(args.start_epoch)
         
-    if args.eval:
+    if args.eval: #pending update for combined training
         test_stats = evaluate(data_loader_val, model, device, amp_autocast, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-        test_stats = evaluate(data_loader_val, model_ema, device, amp_autocast, args)
+        test_stats = evaluate(data_loader_val, model_ema.ema, device, amp_autocast, args)
         print(f"Accuracy of the ema network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
     
@@ -517,7 +551,7 @@ def main(args):
     if args.local_rank == 0 and args.gpu == 0:
         mlflow.log_param("n_parameters", n_parameters)
 
-    print(f"Start training for {args.epochs} epochs")
+    print(f"Start training for {args.epochs} epochs") 
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
@@ -595,4 +629,8 @@ if __name__ == '__main__':
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     print("Data path:", args.data_path)
     print("Dataset:", args.data_set)
+    # from timm.models import list_models
+    # print(list_models('vit*'))
+    # import sys
+    # sys.exit(0)
     main(args)

@@ -36,7 +36,10 @@ class DistillationLoss(torch.nn.Module):
             # assume that the model outputs a tuple of [outputs, outputs_kd]
             outputs, outputs_kd = outputs
         base_loss = self.base_criterion(outputs, labels)
+        # print('self.distillation_type',self.distillation_type)
         if self.distillation_type == 'none':
+            # print('here return base loss',base_loss)
+            # print('base_criterion',self.base_criterion)
             return base_loss
 
         if outputs_kd is None:

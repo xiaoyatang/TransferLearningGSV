@@ -20,18 +20,34 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
-from samplers import RASampler
+from samplers import RASampler,BalancedRASampler
 from augment import new_data_aug_generator
 
 from contextlib import suppress
 
 import models_mamba
-
+import vision_transformer as vits # DINO's local vision_transformer.py
+from torchvision import models as torchvision_models
 import utils
 
 # log about
 import mlflow
+from torch import nn as nn
 
+class MultiLabelHead(nn.Module):
+    def __init__(self, in_features=768, hidden_features=512, out_features=11, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        return x
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -39,11 +55,14 @@ def get_args_parser():
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--bce-loss', action='store_true')
     parser.add_argument('--unscale-lr', action='store_true')
-    parser.add_argument('--freeze_backbone', action='store_true') 
 
     # Model parameters
     parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
+    parser.add_argument('--patch_size', default=16, type=int) # for vit_small, matching dino
+    parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")# for vit_small, matching dino
+    parser.add_argument('--freeze_backbone', action='store_true') 
+
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -161,7 +180,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data_set', default='NotSinFamily', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET', 'NotSinFamily', 'GREEN30', 'SIDEWALKS'],
+    parser.add_argument('--data_set', default='STREET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'STREET','NotSinFamily','GREEN30','SIDEWALKS'],
                         type=str, help='Image Net dataset path') # data-set
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -176,6 +195,8 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
+    parser.add_argument('--attn_map', action='store_true', help='Draw attention map only in eval mode')
+    parser.add_argument('--attn_threshold', type=float, default=None, help='We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass')
     parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=10, type=int)
@@ -195,9 +216,6 @@ def get_args_parser():
     parser.add_argument('--if_amp', action='store_true')
     parser.add_argument('--no_amp', action='store_false', dest='if_amp')
     parser.set_defaults(if_amp=False)
-
-    parser.add_argument('--attn_map', action='store_true', help='Draw attention map only in eval mode')
-    parser.add_argument('--attn_threshold', type=float, default=None, help='We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass')
 
     # if continue with inf
     parser.add_argument('--if_continue_inf', action='store_true')
@@ -258,12 +276,17 @@ def main(args):
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
     if args.distributed:
+        print("distributed data sampler.")
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         if args.repeated_aug:
-            sampler_train = RASampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            # sampler_train = RASampler(
+            #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            # )
+            sampler_train = BalancedRASampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, num_repeats = 2,batch_size=args.batch_size
             )
+            print({k: len(v) for k, v in sampler_train._get_class_indices().items()}) # for debug
         else:
             sampler_train = torch.utils.data.DistributedSampler(
                 dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
@@ -280,6 +303,7 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        print("no distributed!")
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -288,6 +312,7 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
+
     if args.ThreeAugment:
         data_loader_train.dataset.transform = new_data_aug_generator(args)
 
@@ -299,6 +324,9 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=False
     )
+    print('train_dataloader',len(data_loader_train),len(data_loader_train.dataset))
+    print('val_dataloader',len(data_loader_val),len(data_loader_val.dataset))
+
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -309,21 +337,35 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
-    model = create_model(
-        args.model,
-        pretrained=False,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        img_size=args.input_size
-    )
-    for name, param in model.named_parameters():
-        if 'backbone' in name or 'layers' in name:  # Adjust prefix to match your model
-            print(f"{name}: {param.norm():.4f}")
-            break  # Just check one or two
+    # if args.model in vits.__dict__:
+    #     # Vision Transformer models from local definition
+    #     model = vits.__dict__[args.model](
+    #         patch_size=args.patch_size,
+    #         drop_path_rate=args.drop_path_rate,  # stochastic depth
+    #         num_classes=args.nb_classes  # args.nb_classes / 0 for self-defined head
+    #     )  
 
-                    
+    # model.head = MultiLabelHead(in_features=768, hidden_features=512, out_features=args.nb_classes, dropout=0.1)
+    model = torchvision_models.resnet50(weights=torchvision_models.ResNet50_Weights.IMAGENET1K_V2)
+    in_features = model.fc.in_features
+    model.fc = torch.nn.Linear(in_features, args.nb_classes)
+    print(f"✅ Loaded ResNet-50 (ImageNet pretrained). num_classes={args.nb_classes}")
+    
+    # ======== Before finetune checkpoint load ========
+    print("Checking model parameters before finetune loading...")
+    found_param = False
+    for name, param in model.named_parameters():
+        if any(x in name for x in ['blocks', 'layers']):
+            print(f"Before loading pretrained weights, {name}: {param.norm():.4f}")
+            found_param = True
+            break
+    if not found_param:
+        for name, param in model.named_parameters():
+            if 'conv1' in name or 'layer1' in name:  # for ResNet
+                print(f"Before loading pretrained weights (ResNet style), {name}: {param.norm():.4f}")
+                break
+
+    # ======== Finetune checkpoint load ========
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -331,100 +373,112 @@ def main(args):
         else:
             checkpoint = torch.load(args.finetune, map_location='cpu')
 
-        if is_dino_checkpoint(checkpoint):
-            print("✅ This is a DINO checkpoint.")
-            #load dino pretrained weights
-            student_state_dict = checkpoint["student"]
-            # 1. Remove 'module.' prefix if needed
+        print(f"🔍 Loaded checkpoint from {args.finetune} with keys: {checkpoint.keys()}")
+
+        # ----- handle ViT / DINO checkpoints -----
+        if 'student' in checkpoint or 'teacher' in checkpoint:
+            print("Detected DINO-style checkpoint; converting keys...")
+            student_state_dict = checkpoint.get('student', checkpoint)
             student_state_dict = {k.replace("module.", ""): v for k, v in student_state_dict.items()}
             checkpoint_model = {
-                k.replace("backbone.", ""): v for k, v in student_state_dict.items() if k.startswith("backbone.")
+                k.replace("backbone.", ""): v for k, v in student_state_dict.items()
+                if k.startswith("backbone.")
             }
-        else:
-            print("❌ This is NOT a DINO checkpoint, likely load from ImageNet pretrained weights.")
-            checkpoint_model = checkpoint['model']
+
+        # ----- handle standard timm / ImageNet checkpoint -----
+        elif "model" in checkpoint:
+            print("📦 Detected standard timm/ImageNet checkpoint")
+            checkpoint_model = checkpoint["model"]
             state_dict = model.state_dict()
-            for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
-                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint")
-                    del checkpoint_model[k]
-
-        # interpolate position embedding
-        pos_embed_checkpoint = checkpoint_model['pos_embed']
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        num_patches = model.patch_embed.num_patches
-        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
-        # height (== width) for the checkpoint position embedding
-        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-        # height (== width) for the new position embedding
-        new_size = int(num_patches ** 0.5)
-        # class_token and dist_token are kept unchanged
-        extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-        # only the position tokens are interpolated
-        pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-        pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-        pos_tokens = torch.nn.functional.interpolate(
-            pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-        pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-        new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-        checkpoint_model['pos_embed'] = new_pos_embed
-
-        # model.load_state_dict(checkpoint_model, strict=False)
-        missing, unexpected = model.load_state_dict(checkpoint_model, strict=False)
-        print("Missing keys:", missing)
-        print("Unexpected keys:", unexpected)
-        for name, param in model.named_parameters():
-            if 'backbone' in name or 'layers' in name:  # Adjust prefix to match your model
-                print(f"{name}: {param.norm():.4f}")
-                break  # Just check one or two
-
-        if args.freeze_backbone:
-            print("🚫 Freezing backbone parameters (excluding classification head).")
-            for name, param in model.named_parameters():
-                if not (name.startswith('head.') or name.startswith('head_dist.')):
-                    param.requires_grad = False
-            # ✅ Sanity check: Print requires_grad status
-            trainable = [name for name, p in model.named_parameters() if p.requires_grad]
-            assert all(n.startswith('head.') or n.startswith('head_dist.') for n in trainable), \
-                f"Unexpected trainable params: {trainable}"
+            # 删除不匹配的分类头参数
+            head_keys = ["head.weight", "head.bias", "head_dist.weight", "head_dist.bias",
+                         "fc.weight", "fc.bias"]
+            for k in head_keys:
+                if k in checkpoint_model and k in state_dict:
+                    if checkpoint_model[k].shape != state_dict[k].shape:
+                        print(f"Removing key {k} due to shape mismatch.")
+                        del checkpoint_model[k]
+        else:
+            print("⚠️ Unrecognized checkpoint format; loading directly as state_dict.")
+            checkpoint_model = checkpoint
         
+        print("🔧 Loading model state dict...")
+        missing, unexpected = model.load_state_dict(checkpoint_model, strict=False)
+        print("✅ Model loaded.")
+        if missing:
+            print("Missing keys:", missing)
+        if unexpected:
+            print("Unexpected keys:", unexpected)
+
+        # ----- post-load sanity check -----
+        found_param = False
+        for name, param in model.named_parameters():
+            if any(x in name for x in ['blocks', 'layers']):
+                print(f"After loading pretrained weights, {name}: {param.norm():.4f}")
+                found_param = True
+                break
+        if not found_param:
+            for name, param in model.named_parameters():
+                if 'conv1' in name or 'layer1' in name:
+                    print(f"After loading pretrained weights (ResNet style), {name}: {param.norm():.4f}")
+                    break
+
+    # ======== Freeze backbone ========
+    if args.freeze_backbone:
+        print("🚫 Freezing backbone parameters (excluding classification head).")
+        # for name, param in model.named_parameters():
+        #     # ViT 用 head，ResNet 用 fc
+        #     if not (name.startswith('head.') or name.startswith('fc.')):
+        #         param.requires_grad = False
+        for name, param in model.named_parameters():
+            if name.startswith("fc."):
+                param.requires_grad = True    # Only train head
+            else:
+                param.requires_grad = False
+        trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+        print(f"Trainable params: {trainable}")
+
+# ======== Optional attention-only fine-tune ========
     if args.attn_only:
-        for name_p,p in model.named_parameters():
+        print("⚙️ Setting attention-only mode (mainly for ViT).")
+        for name_p, p in model.named_parameters():
             if '.attn.' in name_p:
                 p.requires_grad = True
             else:
                 p.requires_grad = False
-        try:
-            model.head.weight.requires_grad = True
-            model.head.bias.requires_grad = True
-        except:
-            model.fc.weight.requires_grad = True
-            model.fc.bias.requires_grad = True
-        try:
+        # try both ViT and ResNet naming
+        for head_name in ['head', 'fc']:
+            if hasattr(model, head_name):
+                head = getattr(model, head_name)
+                if hasattr(head, 'weight'):
+                    head.weight.requires_grad = True
+                    head.bias.requires_grad = True
+        if hasattr(model, 'pos_embed'):
             model.pos_embed.requires_grad = True
-        except:
-            print('no position encoding')
-        try:
+        else:
+            print('no position encoding (as expected for ResNet)')
+        if hasattr(model, 'patch_embed'):
             for p in model.patch_embed.parameters():
                 p.requires_grad = False
-        except:
-            print('no patch embed')
+        else:
+            print('no patch embed (as expected for ResNet)')
             
+# ======== Model to device & wrappers ========
     model.to(device)
-
     model_ema = None
     if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEma(
             model,
             decay=args.model_ema_decay,
             device='cpu' if args.model_ema_force_cpu else '',
-            resume='')
+            resume=''
+        )
 
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
@@ -487,8 +541,21 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
 
+        print(f"🔍 Resuming from checkpoint: {args.resume}")
+        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        # print(f"After loading pretrained weights, blocks.0.norm1.weight: {model_without_ddp.blocks[0].norm1.weight.data.mean().item():.4f}")
+        if hasattr(model_without_ddp, "blocks"):  # ViT / ViM / DINO
+            print("After loading weights, model has 'block':",
+                model_without_ddp.blocks[0].norm1.weight.data.mean().item())
+        else:  # ResNet
+            print("After loading weights, model has no 'block':",
+                model_without_ddp.layer1[0].conv1.weight.data.mean().item())
+        if missing_keys:
+            print(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys}")
+            
         # add ema load
         if args.model_ema:
                 utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
@@ -509,7 +576,7 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device, amp_autocast, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-        test_stats = evaluate(data_loader_val, model_ema, device, amp_autocast, args)
+        test_stats = evaluate(data_loader_val, model_ema.ema, device, amp_autocast, args)
         print(f"Accuracy of the ema network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
     
@@ -595,4 +662,8 @@ if __name__ == '__main__':
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     print("Data path:", args.data_path)
     print("Dataset:", args.data_set)
+    # from timm.models import list_models
+    # print(list_models('vit*'))
+    # import sys
+    # sys.exit(0)
     main(args)

@@ -1,0 +1,2 @@
+# python ./vim/main.py --eval --resume ./vim_s_midclstok_ft_81p6acc.pth --model vim_small_patch16_stride8_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2 --data-path /home/collab/u1368791/Hierarchical-Transformer/datasets/IMAGENET1K/ILSVRC/Data/CLS-LOC
+python ./vim/main.py --eval --resume ./vim_s_midclstok_ft_81p6acc.pth --model vim_small_patch16_stride8_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2 --data-path /home/collab/u1368791/Vim/data/streetlights --data-set STREET
